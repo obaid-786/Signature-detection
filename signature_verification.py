@@ -1,26 +1,51 @@
-
-# ========== IMPORTS CLEANED ==========
-import numpy as np
-import os
-import shutil 
 import matplotlib
+matplotlib.use('TkAgg') 
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+# ========== GLOBAL CONFIGURATION ==========
+import os
+import tensorflow as tf
+
+SEED = 42
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU
+os.environ['PYTHONHASHSEED'] = str(SEED)
+
+# ========== TENSORFLOW CONFIGURATION ==========
+# Set global random seeds
+tf.keras.utils.set_random_seed(SEED)
+# Configure thread pools
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
+# Enable soft device placement
+tf.config.set_soft_device_placement(True)
+
+# ========== REST OF IMPORTS ==========
+import numpy as np
+np.random.seed(42)
+tf.random.set_seed(42)  # Updated for TF 2.x
+
+
+
+# ========== REST OF IMPORTS ==========
+import numpy as np
+import shutil 
 from scipy import ndimage
+from skimage.measure import moments, moments_hu
 from skimage.measure import regionprops, label
 from skimage import io
 from skimage.filters import threshold_otsu, threshold_local
 from skimage import exposure
 from traceback import format_exc
 import pandas as pd
+from tensorflow.keras import layers, utils, callbacks
 from itertools import chain
 from time import time
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
-from tensorflow.keras import layers, utils
 from tensorflow import keras
 from sklearn.preprocessing import StandardScaler
-from sklearn.exceptions import NotFittedError
+from sklearn.utils.validation import NotFittedError
 import joblib
  
 
@@ -162,6 +187,14 @@ def SkewKurtosis(img):
     return (skewx , skewy), (kurtx, kurty)
 
 
+def calculate_zernike(img):
+    try:
+        m = moments(img)
+        hu_moments = moments_hu(m)
+        return hu_moments[0]  # Use first Hu moment
+    except:
+        return 0.0
+
 def getFeatures(path, img=None, display=False):
     if img is None:
         img = mpimg.imread(path)
@@ -201,11 +234,11 @@ def getCSVFeatures(path, img=None, display=False):
                 eccentricity = main_region.eccentricity
                 solidity = main_region.solidity
 
-        # Skew/kurtosis with numerical stability
-        skew_x = skew_y = 0.0
-        if np.var(binary_img) > 1e-5:  # Avoid division by zero
+        # Skewness and Kurtosis
+        skew_x = skew_y = kurt_x = kurt_y = 0.0
+        if np.var(binary_img) > 1e-5:
             try:
-                (skew_x, skew_y), _ = SkewKurtosis(binary_img)
+                (skew_x, skew_y), (kurt_x, kurt_y) = SkewKurtosis(binary_img)
             except:
                 pass
 
@@ -219,19 +252,32 @@ def getCSVFeatures(path, img=None, display=False):
             homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
         except Exception as e:
             if display:
-                print(f"Texture features failed: {str(e)}")
+                print(f"GLCM failed: {str(e)}")
         # Add final validation before return
         if all(v == 0 for v in (contrast, homogeneity)) and (cent_y, cent_x) == (0.5, 0.5):
             raise ValueError("Invalid feature extraction - likely no signature detected")
+        # Add new features
+        from skimage.feature import hog
+        # HOG features
+        fd, hog_image = hog(img, orientations=8, pixels_per_cell=(16,16),
+                          cells_per_block=(1,1), visualize=True)
+        hog_mean = np.mean(fd)
         
+        
+        # Zernike Moments (updated)
+        m = moments(img)
+        hu_moment = calculate_zernike(img)
+
+        zernike = m[0,2] + m[2,0]  # Simple moment combination
         return (round(ratio,4), round(cent_y,4), round(cent_x,4),
                 round(eccentricity,4), round(solidity,4),
                 round(contrast,4), round(homogeneity,4),
-                round(skew_x,4), round(skew_y,4))
+                round(skew_x,4), round(skew_y,4),
+                round(kurt_x,4), round(kurt_y,4), round(hog_mean,4), round(hu_moment,4))
     
     except Exception as e:
         print(f"Feature error: {str(e)}")
-        return (0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return (0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
   
 
 def verify_image_shapes():
@@ -300,7 +346,7 @@ def makeCSV():
         if not os.path.exists(train_file):
             print(f'Creating training CSV for Person {person}...')
             with open(train_file, 'w') as handle:
-                handle.write('ratio,cent_y,cent_x,eccentricity,solidity,skew_x,skew_y,kurt_x,kurt_y,output\n')
+                handle.write('ratio,cent_y,cent_x,eccentricity,solidity,contrast,homogeneity,skew_x,skew_y,kurt_x,kurt_y,hog_mean,zernike,output\n')
                 # Add genuine samples (1-15)
                 for i in range(1, 16):
                     source = os.path.join(gpath, f'original_{person}_{i}.png')
@@ -316,7 +362,7 @@ def makeCSV():
         if not os.path.exists(test_file):
             print(f'Creating testing CSV for Person {person}...')
             with open(test_file, 'w') as handle:
-                handle.write('ratio,cent_y,cent_x,eccentricity,solidity,skew_x,skew_y,kurt_x,kurt_y,output\n')
+                handle.write('ratio,cent_y,cent_x,eccentricity,solidity,contrast,homogeneity,skew_x,skew_y,kurt_x,kurt_y,hog_mean,zernike,output\n')
                 # Add genuine samples (16-24)
                 for i in range(16, 25):
                     source = os.path.join(gpath, f'original_{person}_{i}.png')
@@ -348,8 +394,8 @@ def testing(test_image_path, person_id):
         if features is None:
             raise ValueError("Feature extraction failed completely")
             
-        if len(features) != 9:
-            raise ValueError(f"Invalid feature count: {len(features)} (expected 9)")
+        if len(features) != 13:
+            raise ValueError(f"Invalid feature count: {len(features)} (expected 13)")
             
         # Convert to numpy array with proper shape
         features_array = np.array(features).reshape(1, -1)
@@ -383,9 +429,12 @@ def testing(test_image_path, person_id):
 
         # Write RAW features with headers
         pd.DataFrame(features_array, 
-                    columns=['ratio','cent_y','cent_x','eccentricity',
-                             'solidity','contrast','homogeneity',
-                             'skew_x','skew_y']).to_csv(test_csv, index=False)
+                columns=[
+                'ratio','cent_y','cent_x','eccentricity',
+                'solidity','contrast','homogeneity',
+                'skew_x','skew_y','kurt_x','kurt_y',
+                'hog_mean','zernike'  # New features
+            ]).to_csv(test_csv, index=False)
 
         # Final validation
         if not pd.read_csv(test_csv).shape[0] == 1:
@@ -402,14 +451,17 @@ def testing(test_image_path, person_id):
                 print(f"Cleanup failed: {str(cleanup_err)}")
         return None
 
-n_input = 9
+n_input = 13
 
 # ================== IMPROVEMENT 2: Feature Normalization ==================
+def augment_features(features, label):
+    """Synthetic feature augmentation"""
+    jitter = np.random.normal(0, 0.01, features.shape)
+    return features + jitter, label
 
 
 def readCSV(train_path, test_path, type2=False, scaler=None):
     """Enhanced CSV reader with robust validation and error handling"""
-    
     def validate_data(data, source):
         """Helper function for data validation"""
         if data.size == 0:
@@ -420,59 +472,81 @@ def readCSV(train_path, test_path, type2=False, scaler=None):
 
     try:
         # ========== Train Data Processing ==========
-        # Read and validate training features
-        df_train = pd.read_csv(train_path, usecols=range(n_input))
+        # Read full training CSV with all columns
+        df_train = pd.read_csv(train_path)
         if df_train.empty:
             raise ValueError(f"Empty training CSV: {train_path}")
-            
-        train_input = validate_data(
-            df_train.values.astype(np.float32, copy=False),
-            "training features"
-        )
 
-        # Scaler handling with fallback
-        if scaler is None:
-            scaler = StandardScaler()
-            train_input = scaler.fit_transform(train_input)
-        else:  # Verification mode
-            train_input = scaler.transform(train_input)
+        # Validate column count (14 columns expected: 13 features + 1 output)
+        if df_train.shape[1] != 14:
+            raise ValueError(
+                f"Training CSV has {df_train.shape[1]} columns, expected 14\n"
+                f"Columns: {df_train.columns.tolist()}"
+            )
 
-        # Read and validate training labels
-        df_train_labels = pd.read_csv(train_path, usecols=(n_input,))
-        if df_train_labels.empty:
-            raise ValueError(f"Empty training labels in {train_path}")
-            
+        # Extract features and labels using position index
+        train_input = df_train.iloc[:, :13].values.astype(np.float32, copy=False)
+        train_labels = df_train.iloc[:, 13].astype(int)
+        
+        # Feature augmentation with matching label augmentation
+        original_samples = len(train_input)
+        augmented_genuine = [augment_features(feat, 1) for feat in train_input[:15]]
+        augmented_forged = [augment_features(feat, 0) for feat in train_input[15:30]]
+        
+        # Stack original and augmented data
+        train_input = np.vstack([
+            train_input,
+            [aug[0] for aug in augmented_genuine],
+            [aug[0] for aug in augmented_forged]
+        ])
+        
+        # Create matching labels for augmented data
         corr_train = tf.keras.utils.to_categorical(
-            df_train_labels.values.flatten().astype(int), 
+            np.concatenate([
+                train_labels,
+                [1]*len(augmented_genuine),
+                [0]*len(augmented_forged)
+            ]), 
             2
         )
 
+        # ========== Scaler Handling ==========
+        if scaler is None:
+            scaler = StandardScaler()
+            train_input = scaler.fit_transform(train_input)
+            # Save scaler
+            os.makedirs(SAVED_MODELS_DIR, exist_ok=True)
+            person_id = os.path.basename(train_path).split('_')[1].split('.')[0]
+            scaler_path = os.path.join(SAVED_MODELS_DIR, f'scaler_{person_id}.pkl')
+            joblib.dump(scaler, scaler_path)
+        else:
+            train_input = scaler.transform(train_input)
+
         # ========== Test Data Processing ==========
-        # Read and validate test features
-        df_test = pd.read_csv(test_path, usecols=range(n_input))
+        df_test = pd.read_csv(test_path)
         if df_test.empty:
             raise ValueError(f"Empty test CSV: {test_path}")
-            
-        test_input = validate_data(
-            df_test.values.astype(np.float32, copy=False),
-            "test features"
-        )
+
+        # Validate test column count
+        if df_test.shape[1] != 14:
+            raise ValueError(
+                f"Test CSV has {df_test.shape[1]} columns, expected 14\n"
+                f"Columns: {df_test.columns.tolist()}"
+            )
+
+        test_input = df_test.iloc[:, :13].values.astype(np.float32, copy=False)
+        test_input = validate_data(test_input, "test features")
         
         # Ensure 2D array for scaler
         if test_input.ndim == 1:
-            test_input = test_input.reshape(-1, n_input)
+            test_input = test_input.reshape(-1, 13)
             
         test_input = scaler.transform(test_input)
 
         # ========== Return Handling ==========
         if not type2:
-            # Training mode: process test labels
-            df_test_labels = pd.read_csv(test_path, usecols=(n_input,))
-            if df_test_labels.empty:
-                raise ValueError(f"Empty test labels in {test_path}")
-                
             corr_test = tf.keras.utils.to_categorical(
-                df_test_labels.values.flatten().astype(int),
+                df_test.iloc[:, 13].astype(int),
                 2
             )
             return train_input, corr_train, test_input, corr_test, scaler
@@ -480,196 +554,138 @@ def readCSV(train_path, test_path, type2=False, scaler=None):
         return train_input, corr_train, test_input, scaler
 
     except Exception as e:
-        print(f"CSV Read Error: {str(e)}")
+        print(f"\nCSV Read Error: {str(e)}")
         print(f"Train path: {train_path}")
         print(f"Test path: {test_path}")
         print(f"Type2 mode: {type2}")
         raise
 
 # Parameters
-learning_rate = 0.0001        # Reduced learning rate
-training_epochs = 1000        # Increased epochs         # Reduced from 1000 (early stopping will handle termination)
+learning_rate = 0.0005        # Reduced learning rate
+training_epochs = 1500        # Increased epochs         # Reduced from 1000 (early stopping will handle termination)
 display_step = 1
 
-n_hidden_1 = 128
-n_hidden_2 = 64
-n_hidden_3 = 32
+n_hidden_1 = 256
+n_hidden_2 = 128
+n_hidden_3 = 64
 n_classes = 2 # no. of classes (genuine or forged)
 
 def multilayer_perceptron(x):
     # Layer 1 with full variable scoping
     with tf.variable_scope('layer1'):
-        w1 = tf.get_variable('weights', initializer=tf.keras.initializers.he_normal()([n_input, n_hidden_1]))
+        w1 = tf.get_variable(
+            'weights', 
+            shape=[n_input, n_hidden_1],
+            initializer=tf.keras.initializers.he_normal(seed=SEED),
+            regularizer=tf.keras.regularizers.l2(0.001)  # L2 regularization
+        )
         b1 = tf.get_variable('biases', initializer=tf.zeros([n_hidden_1]))
         layer = tf.nn.relu(tf.matmul(x, w1) + b1)
         layer = tf.keras.layers.BatchNormalization(name='bn1')(layer)
-        layer = tf.nn.dropout(layer, rate=0.3)
+        layer = tf.nn.dropout(layer, rate=0.3, seed=SEED)
 
     # Layer 2 with full variable scoping    
     with tf.variable_scope('layer2'):
-        w2 = tf.get_variable('weights', initializer=tf.keras.initializers.he_normal()([n_hidden_1, n_hidden_2]))
+        w2 = tf.get_variable(
+            'weights',
+            shape=[n_hidden_1, n_hidden_2],
+            initializer=tf.keras.initializers.he_normal(seed=SEED),
+            regularizer=tf.keras.regularizers.l2(0.001)  # L2 regularization
+        )
         b2 = tf.get_variable('biases', initializer=tf.zeros([n_hidden_2]))
         layer = tf.nn.relu(tf.matmul(layer, w2) + b2)
         layer = tf.keras.layers.BatchNormalization(name='bn2')(layer)
-        layer = tf.nn.dropout(layer, rate=0.3)
+        layer = tf.nn.dropout(layer, rate=0.3, seed=SEED)
 
     # Layer 3 with full variable scoping
     with tf.variable_scope('layer3'):
-        w3 = tf.get_variable('weights', initializer=tf.keras.initializers.he_normal()([n_hidden_2, n_hidden_3]))
+        w3 = tf.get_variable(
+            'weights',
+            shape=[n_hidden_2, n_hidden_3],
+            initializer=tf.keras.initializers.he_normal(seed=SEED),
+            regularizer=tf.keras.regularizers.l2(0.001)  # L2 regularization
+        )
         b3 = tf.get_variable('biases', initializer=tf.zeros([n_hidden_3]))
         layer = tf.nn.relu(tf.matmul(layer, w3) + b3)
 
     # Output layer
     with tf.variable_scope('output'):
-        w_out = tf.get_variable('weights', initializer=tf.keras.initializers.glorot_uniform()([n_hidden_3, n_classes]))
+        w_out = tf.get_variable(
+            'weights',
+            shape=[n_hidden_3, n_classes],
+            initializer=tf.keras.initializers.glorot_uniform(seed=SEED),
+            regularizer=tf.keras.regularizers.l2(0.001)  # L2 regularization
+        )
         b_out = tf.get_variable('biases', initializer=tf.zeros([n_classes]))
         out_layer = tf.matmul(layer, w_out) + b_out
 
     return out_layer
 
 def evaluate(train_path, test_path, type2=False):
-    # Reset graph and create new session for each evaluation
-    tf.reset_default_graph()
-    
-    # Get person ID early
+    # Get person ID
     person_id = os.path.basename(train_path).split('_')[1].split('.')[0]
-    model_dir = SAVED_MODELS_DIR
-    scaler_path = os.path.join(model_dir, f'scaler_{person_id}.pkl')
-
-    # Load data with scaler handling
+    model_dir = os.path.join(SAVED_MODELS_DIR, f'model_{person_id}.keras')  # Directory for SavedModel
+    
+    # Load data
+    train_input, corr_train, test_input, corr_test, scaler = readCSV(train_path, test_path)
+    
     if not type2:
-        # Training mode: fit and save scaler
-        train_input, corr_train, test_input, corr_test, scaler = readCSV(train_path, test_path)
-        joblib.dump(scaler, scaler_path)  # Save scaler for future use
+        # Model definition for training
+        model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(n_input,), name='input_layer'),
+    tf.keras.layers.Dense(n_hidden_1, activation='relu'),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dropout(0.3),
+    tf.keras.layers.Dense(n_hidden_2, activation='relu'),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dropout(0.3),
+    tf.keras.layers.Dense(n_hidden_3, activation='relu'),
+    tf.keras.layers.Dense(n_classes, activation='softmax', name='output_layer')
+])
+
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate),
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy'])
+
+        # Training with ModelCheckpoint for SavedModel format
+        checkpoint = tf.keras.callbacks.ModelCheckpoint(
+            filepath=model_dir,
+            save_best_only=True,
+            save_weights_only=False,
+            monitor='val_accuracy',
+            mode='max',
+        )
+
+        model.fit(train_input, corr_train,
+                validation_data=(test_input, corr_test),
+                epochs=training_epochs,
+                batch_size=64,
+                callbacks=[checkpoint, tf.keras.callbacks.EarlyStopping(patience=30)])
+
+        # Load best model for evaluation
+        best_model = tf.keras.models.load_model(model_dir)
+        train_acc = best_model.evaluate(train_input, corr_train, verbose=0)[1]
+        test_acc = best_model.evaluate(test_input, corr_test, verbose=0)[1]
+        return train_acc, test_acc
     else:
-        # Verification mode: load existing scaler
-        if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"Scaler not found for person {person_id}. Train first!")            
-        scaler = joblib.load(scaler_path)
-        # Load test data using stored scaler
-        train_input, corr_train, test_input, _ = readCSV(train_path, test_path, type2=True, scaler=scaler)
+        # Verification: Load the saved model
+        model = tf.keras.models.load_model(model_dir)
+        pred = model.predict(test_input)
+        genuine_prob = pred[0][1]
         
-        if test_input.ndim == 1:
-            test_input = test_input.reshape(1, -1)
+        # Display results
+        if genuine_prob > 0.6:
+            print(f'Genuine Signature ({genuine_prob:.2%} confidence)')
+            return True
+        elif genuine_prob < 0.4:
+            print(f'Forged Signature ({1-genuine_prob:.2%} confidence)')
+            return False
+        else:
+            print(f'Uncertain Prediction ({genuine_prob:.2%})')
+            return None
 
-    # Model persistence setup
-    model_dir = SAVED_MODELS_DIR
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, f'model_{person_id}.ckpt')
 
-    # Define model architecture within the new graph context
-    with tf.Graph().as_default():
-        X = tf.placeholder(tf.float32, [None, n_input])
-        Y = tf.placeholder(tf.float32, [None, n_classes])
-        keep_prob = tf.placeholder(tf.float32)
-
-        # Define network parameters within this graph context
-        weights = {
-            'h1': tf.Variable(tf.keras.initializers.he_normal()([n_input, n_hidden_1])),
-            'h2': tf.Variable(tf.keras.initializers.he_normal()([n_hidden_1, n_hidden_2])),
-            'h3': tf.Variable(tf.keras.initializers.he_normal()([n_hidden_2, n_hidden_3])),
-            'out': tf.Variable(tf.keras.initializers.glorot_uniform()([n_hidden_3, n_classes]))
-        }
-
-        biases = {
-            'b1': tf.Variable(tf.zeros([n_hidden_1])),
-            'b2': tf.Variable(tf.zeros([n_hidden_2])),
-            'b3': tf.Variable(tf.zeros([n_hidden_3])),
-            'out': tf.Variable(tf.zeros([n_classes]))
-        }
-
-        
-
-        # Build model components
-        logits = multilayer_perceptron(X)
-        cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(logits=logits, labels=Y)
-        loss_op = tf.reduce_mean(cross_entropy)
-        optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-        train_op = optimizer.minimize(loss_op)
-        pred = tf.nn.softmax(logits)
-        correct_prediction = tf.equal(tf.argmax(pred, 1), tf.argmax(Y, 1))
-        accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-        init = tf.global_variables_initializer()
-
-        with tf.Session() as sess:
-            saver = tf.train.Saver()
-            
-            if os.path.exists(model_path + '.index'):
-                saver.restore(sess, model_path)
-                print(f"Loaded trained model for person {person_id}")
-            else:
-                sess.run(init)
-                best_val_acc = 0.0
-                patience = 25
-                no_improve = 0
-                
-                try:
-                    for epoch in range(training_epochs):
-                        # Mini-batch training
-                        for i in range(0, len(train_input), 64):
-                            batch_x = train_input[i:i+64]
-                            batch_y = corr_train[i:i+64]
-                            sess.run(train_op, feed_dict={
-                                X: batch_x, 
-                                Y: batch_y, 
-                                keep_prob: 0.7
-                            })
-
-                        # Validation
-                        val_acc = accuracy.eval({
-                            X: test_input,
-                            Y: corr_test,
-                            keep_prob: 1.0
-                        })
-
-                        # Early stopping
-                        if val_acc > best_val_acc:
-                            best_val_acc = val_acc
-                            no_improve = 0
-                            saver.save(sess, model_path)
-                        else:
-                            no_improve += 1
-
-                        if no_improve >= patience:
-                            print(f"Early stopping at epoch {epoch+1}")
-                            break
-                finally:
-                    saver.restore(sess, model_path)
-                    print(f"Training complete for person {person_id}")
-
-            # Prediction/Evaluation
-            confidence_threshold = 0.7
-            
-            if not type2:
-                train_acc = accuracy.eval({
-                    X: train_input, 
-                    Y: corr_train, 
-                    keep_prob: 1.0
-                })
-                test_acc = accuracy.eval({
-                    X: test_input, 
-                    Y: corr_test, 
-                    keep_prob: 1.0
-                })
-                return train_acc, test_acc
-            else:
-                prediction = pred.eval({
-                    X: test_input, 
-                    keep_prob: 1.0
-                })
-                genuine_prob = prediction[0][1]
-                
-                if genuine_prob > confidence_threshold:
-                    print(f'Genuine Signature ({genuine_prob:.2%} confidence)')
-                    return True
-                elif genuine_prob < (1 - confidence_threshold):
-                    print(f'Forged Signature ({1 - genuine_prob:.2%} confidence)')
-                    return False
-                else:
-                    print(f'Uncertain Prediction ({genuine_prob:.2%})')
-                    return None
-
-def trainAndTest(rate=0.001, epochs=500, neurons=128, display=True):
+def trainAndTest(rate=0.001, epochs=1000, neurons=128, display=True):
     start = time()
 
     # ========== UPDATED PARAMETERS ==========
@@ -720,8 +736,53 @@ def nuclear_cleanup():
         os.makedirs(d, exist_ok=True)
     print("All previous data erased. Starting fresh!\n")
 
-# Run at program start
+def verification_interface():
+    while True:
+        try:
+            person_id = int(input("\nEnter person's ID (1-10) or 0 to exit: "))
+            if person_id == 0:
+                break
+                
+            test_image = input("Enter signature image path: ").strip()
+            
+            # Process test image
+            test_csv = testing(test_image, person_id)
+            if not test_csv:
+                continue
 
+            # Get paths
+            train_csv = os.path.join(FEATURES_DIR, 'Training', f'training_{person_id}.csv')
+            model_path = os.path.join(SAVED_MODELS_DIR, f'model_{person_id}.keras')
+
+            # Run verification
+            try:
+                # Get prediction probability
+                genuine_prob = evaluate(train_csv, test_csv, type2=True)
+                
+                # Determine result based on probability
+                if genuine_prob >= 0.5:
+                    prediction = "GENUINE"
+                    confidence = genuine_prob
+                else:
+                    prediction = "FORGED"
+                    confidence = 1 - genuine_prob
+                
+                # Create and display the confidence bar chart
+                plt.figure(figsize=(8, 4))
+                plt.bar(['Genuine', 'Forged'], 
+                        [genuine_prob * 100, (1 - genuine_prob) * 100], 
+                        color=['green', 'red'])
+                plt.title(f'Signature Verification Result: {prediction} ({confidence*100:.2f}% Confidence)')
+                plt.ylabel('Probability (%)')
+                plt.ylim(0, 100)
+                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                plt.show()
+
+            except Exception as e:
+                print(f"Verification error: {str(e)}")
+
+        except Exception as e:
+            print(f"Interface error: {str(e)}")
 
 # ========== MAIN EXECUTION FLOW ==========
 # ========== MAIN EXECUTION FLOW ==========
@@ -753,73 +814,10 @@ if __name__ == "__main__":
         print(f"\nFinal Metrics | Train: {train_acc:.2%} | Test: {test_acc:.2%}")
         print(f"Total Training Time: {time()-start_time:.2f}s")
 
-        # Step 4: Verification Interface
+        # Step 4: Use proper verification interface
         print("\n=== Signature Verification System ===")
-        while True:
-            try:
-                # Get person ID
-                person_id = int(input("\nEnter person's ID (1-10) or 0 to exit: "))
-                if person_id == 0:
-                    print("Exiting system...")
-                    break
-                if not 1 <= person_id <= 10:
-                    print("Please enter between 1-10")
-                    continue
-                
-                # Get signature image
-                test_image = input("Enter signature image path: ").strip()
-                if not os.path.exists(test_image):
-                    print("File not found! Please check path.")
-                    continue
-                
-                # Process test image with error handling
-                test_csv = testing(test_image, person_id)
-                
-                if test_csv is None:
-                    print("Failed to process signature. Possible reasons:")
-                    print("- Image format not supported")
-                    print("- No signature detected in image")
-                    print("- Low quality/unreadable signature")
-                    continue
-                
-                # Run verification
-                train_csv = os.path.join(FEATURES_DIR, 'Training', f'training_{person_id}.csv')
-                model_file = os.path.join(SAVED_MODELS_DIR, f'model_{person_id}.ckpt.index')
-
-                # Fix 1: Corrected training data check
-                if not os.path.exists(train_csv):
-                    print(f"Training data missing for person {person_id}")
-                    continue
-
-                # Fix 2: Proper model existence check and training
-                if not os.path.exists(model_file):
-                    print(f"Model not found. Training first...")
-                    print(f"Training model for person {person_id}...")
-                    # Train only this specific person's model
-                    modified_train_path = os.path.join(FEATURES_DIR, 'Training', f'training_{person_id}.csv')
-                    modified_test_path = os.path.join(FEATURES_DIR, 'Testing', f'testing_{person_id}.csv')
-                    evaluate(modified_train_path, modified_test_path)  # Single-person training
-
-                print("\n=== Verifying Signature ===")
-                try:
-                    result = evaluate(train_csv, test_csv, type2=True)
-                    if result is None:
-                        print("Verification inconclusive - low confidence")
-                    else:
-                        status = "Genuine" if result else "Forged"
-                        print(f"\nVerification Result: {status} signature")
-                except Exception as e:
-                    print(f"Verification failed: {str(e)}")
-                    print("Common causes:")
-                    print("- Corrupted test data file")
-                    print("- Model/scaler version mismatch")
-                    print("- Invalid feature scaling")
-            
-            except ValueError:
-                print("Invalid input. Numbers only please.")
-            except Exception as e:
-                print(f"System error: {str(e)}")
-    
+        verification_interface()  # Call the dedicated interface function
+        
     except KeyboardInterrupt:
         print("\nSystem shutdown requested. Exiting...")
     finally:
